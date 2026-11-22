@@ -20,6 +20,8 @@ aborts the batch without returning a partial result.
 
 from __future__ import annotations
 
+import math
+
 __all__ = [
     "GrainError",
     "apply_grain",
@@ -32,9 +34,51 @@ __all__ = [
     "validate",
 ]
 
+_MASK64 = (1 << 64) - 1
+
 
 class GrainError(ValueError):
     """Raised for invalid frames, layers, strengths, seeds, or configs."""
+
+
+def _is_int(value) -> bool:
+    """Return True for real integers; ``bool`` is not an integer here."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_finite_number(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _require_int(name, value) -> int:
+    if not _is_int(value):
+        raise GrainError(f"{name} must be an integer, got {type(value).__name__}")
+    return value
+
+
+def _require_finite(name, value) -> float:
+    if not _is_finite_number(value):
+        raise GrainError(f"{name} must be a finite number")
+    return float(value)
+
+
+def _require_range(name, value, lo, hi) -> float:
+    value = _require_finite(name, value)
+    if not (lo <= value <= hi):
+        raise GrainError(f"{name} must be in [{lo}, {hi}], got {value}")
+    return value
+
+
+def _mix64(z: int) -> int:
+    """splitmix64 finalizer: a stable, deterministic 64-bit bit mixer."""
+    z &= _MASK64
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9 & _MASK64
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB & _MASK64
+    return z ^ (z >> 31)
 
 
 def hash_noise(x, y, t, seed) -> float:
@@ -51,7 +95,20 @@ def hash_noise(x, y, t, seed) -> float:
     A non-integer argument, a negative ``t``, or a non-finite/out-of-range
     coordinate raises :class:`GrainError`.
     """
-    raise NotImplementedError
+    x = _require_int("x", x)
+    y = _require_int("y", y)
+    t = _require_int("t", t)
+    seed = _require_int("seed", seed)
+    if x < 0 or y < 0:
+        raise GrainError("coordinates x and y must be non-negative")
+    if t < 0:
+        raise GrainError("t must be non-negative")
+
+    h = _mix64(seed & _MASK64)
+    for value in (x, y, t):
+        h = _mix64(h ^ _mix64((value + 0x9E3779B97F4A7C15) & _MASK64))
+    # Top 53 bits -> [0, 1) -> [-1, 1].
+    return (h >> 11) / float(1 << 53) * 2.0 - 1.0
 
 
 def luma_weight(luma, mid, falloff) -> float:
@@ -67,7 +124,14 @@ def luma_weight(luma, mid, falloff) -> float:
     Invalid or non-finite arguments raise :class:`GrainError`.  Values are
     compared with an absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    luma = _require_range("luma", luma, 0.0, 1.0)
+    mid = _require_range("mid", mid, 0.0, 1.0)
+    falloff = _require_finite("falloff", falloff)
+    if falloff <= 0.0:
+        raise GrainError("falloff must be positive")
+
+    weight = 1.0 - abs(luma - mid) / falloff
+    return min(1.0, max(0.0, weight))
 
 
 def grain_layer(w, h, t, seed, size) -> list:
@@ -86,7 +150,60 @@ def grain_layer(w, h, t, seed, size) -> list:
     ``random``.  Invalid types or ranges raise :class:`GrainError`.  Values are
     compared with an absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    w = _require_int("w", w)
+    h = _require_int("h", h)
+    t = _require_int("t", t)
+    seed = _require_int("seed", seed)
+    size = _require_int("size", size)
+    if w <= 0 or h <= 0:
+        raise GrainError("w and h must be positive")
+    if t < 0:
+        raise GrainError("t must be non-negative")
+    if size <= 0:
+        raise GrainError("size must be positive")
+
+    block = min(size, w, h)
+    if block == 1:
+        return [[hash_noise(x, y, t, seed) for x in range(w)] for y in range(h)]
+
+    # Average square blocks of per-pixel noise; each block is constant, so a
+    # larger size visibly smooths the layer.
+    layer = [[0.0] * w for _ in range(h)]
+    for by in range(0, h, block):
+        y1 = min(by + block, h)
+        for bx in range(0, w, block):
+            x1 = min(bx + block, w)
+            total = 0.0
+            for yy in range(by, y1):
+                for xx in range(bx, x1):
+                    total += hash_noise(xx, yy, t, seed)
+            mean = total / ((y1 - by) * (x1 - bx))
+            mean = min(1.0, max(-1.0, mean))
+            for yy in range(by, y1):
+                row = layer[yy]
+                for xx in range(bx, x1):
+                    row[xx] = mean
+    return layer
+
+
+def _check_grid(name, grid, lo, hi):
+    """Validate a rectangular non-empty grid; return (height, width)."""
+    if not isinstance(grid, (list, tuple)) or len(grid) == 0:
+        raise GrainError(f"{name} is empty")
+    width = None
+    for row in grid:
+        if not isinstance(row, (list, tuple)) or len(row) == 0:
+            raise GrainError(f"{name} is ragged")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise GrainError(f"{name} is ragged")
+        for sample in row:
+            if not _is_finite_number(sample):
+                raise GrainError(f"{name} contains non-finite pixel")
+            if not (lo <= sample <= hi):
+                raise GrainError(f"{name} pixel outside [{lo}, {hi}]")
+    return len(grid), width
 
 
 def apply_grain(frame, layer, strength) -> list:
@@ -108,7 +225,19 @@ def apply_grain(frame, layer, strength) -> list:
     :class:`GrainError`.  Values are compared with an absolute tolerance of
     ``1e-6`` unless a tighter tolerance is stated.
     """
-    raise NotImplementedError
+    height, width = _check_grid("frame", frame, 0.0, 1.0)
+    layer_shape = _check_grid("layer", layer, -1.0, 1.0)
+    if layer_shape != (height, width):
+        raise GrainError("frame and layer shapes differ")
+    strength = _require_range("strength", strength, 0.0, 1.0)
+
+    return [
+        [
+            min(1.0, max(0.0, frame[y][x] + strength * layer[y][x]))
+            for x in range(width)
+        ]
+        for y in range(height)
+    ]
 
 
 def blend_grain(a, b, t) -> list:
@@ -129,7 +258,19 @@ def blend_grain(a, b, t) -> list:
     ``[0.0, 1.0]`` raise :class:`GrainError`.  Values are compared with an
     absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    height, width = _check_grid("a", a, -math.inf, math.inf)
+    b_shape = _check_grid("b", b, -math.inf, math.inf)
+    if b_shape != (height, width):
+        raise GrainError("a and b shapes differ")
+    t = _require_range("t", t, 0.0, 1.0)
+
+    return [
+        [
+            (1.0 - t) * a[y][x] + t * b[y][x]
+            for x in range(width)
+        ]
+        for y in range(height)
+    ]
 
 
 def measure_grain(frame) -> float:
@@ -146,7 +287,23 @@ def measure_grain(frame) -> float:
     samples, or samples outside ``[0.0, 1.0]`` raise :class:`GrainError`.
     Values are compared with an absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    height, width = _check_grid("frame", frame, 0.0, 1.0)
+
+    total = 0.0
+    count = 0
+    for y in range(height):
+        row = frame[y]
+        for x in range(width - 1):
+            total += abs(row[x + 1] - row[x])
+            count += 1
+    for y in range(height - 1):
+        row, below = frame[y], frame[y + 1]
+        for x in range(width):
+            total += abs(below[x] - row[x])
+            count += 1
+    if count == 0:
+        return 0.0
+    return min(1.0, max(0.0, total / count))
 
 
 def validate(frame, layer, strength) -> list[str]:
@@ -174,7 +331,49 @@ def validate(frame, layer, strength) -> list[str]:
     samples in ``[-1.0, 1.0]``, and a finite strength in ``[0.0, 1.0]``.
     Comparisons use an absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    issues: list[str] = []
+
+    def check(name, grid, lo, hi):
+        """Append structural problems; return (height, width) or None."""
+        if not isinstance(grid, (list, tuple)) or len(grid) == 0:
+            issues.append(f"{name} is empty")
+            return None
+        width = None
+        ragged = False
+        for row in grid:
+            if not isinstance(row, (list, tuple)) or len(row) == 0:
+                ragged = True
+                continue
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                ragged = True
+        if ragged:
+            issues.append(f"{name} is ragged")
+            return None
+        for row in grid:
+            for sample in row:
+                if not _is_finite_number(sample):
+                    issues.append(f"{name} contains non-finite pixel")
+                    break
+                if not (lo <= sample <= hi):
+                    issues.append(f"{name} pixel outside [{lo}, {hi}]")
+                    break
+            else:
+                continue
+            break
+        return len(grid), width
+
+    frame_shape = check("frame", frame, 0.0, 1.0)
+    layer_shape = check("layer", layer, -1.0, 1.0)
+    if frame_shape is not None and layer_shape is not None:
+        if frame_shape != layer_shape:
+            issues.append("frame and layer shapes differ")
+
+    if not _is_finite_number(strength) or not (0.0 <= strength <= 1.0):
+        issues.append("strength must be in [0, 1]")
+
+    return issues
 
 
 def grain_batch(frames, config) -> dict:
@@ -199,4 +398,37 @@ def grain_batch(frames, config) -> dict:
     has been validated.  Values are compared with an absolute tolerance of
     ``1e-6``.
     """
-    raise NotImplementedError
+    if not hasattr(config, "__getitem__"):
+        raise GrainError("config must be a mapping")
+    try:
+        seed = config["seed"]
+        size = config["size"]
+        strength = config["strength"]
+    except (KeyError, TypeError) as exc:
+        raise GrainError(f"config is missing a required key: {exc}") from exc
+
+    seed = _require_int("seed", seed)
+    size = _require_int("size", size)
+    if size <= 0:
+        raise GrainError("size must be positive")
+    strength = _require_range("strength", strength, 0.0, 1.0)
+
+    if not isinstance(frames, (list, tuple)):
+        raise GrainError("frames must be a sequence of frames")
+
+    # Validate everything before producing any output (atomic batch).
+    shapes = []
+    for i, frame in enumerate(frames):
+        try:
+            shapes.append(_check_grid("frame", frame, 0.0, 1.0))
+        except GrainError as exc:
+            raise GrainError(f"frame {i} is invalid: {exc}") from exc
+
+    processed = []
+    for i, frame in enumerate(frames):
+        height, width = shapes[i]
+        frame_seed = _mix64((seed & _MASK64) ^ _mix64(i + 0x9E3779B97F4A7C15))
+        layer = grain_layer(width, height, i, frame_seed, size)
+        processed.append(apply_grain(frame, layer, strength))
+
+    return {"frames": processed, "count": len(frames)}
